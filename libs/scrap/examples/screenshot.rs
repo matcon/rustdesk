@@ -32,9 +32,8 @@ fn record(i: usize) {
     let (w, h) = (capturer.width(), capturer.height());
 
     loop {
-        // Wait until there's a frame.
-
-        let frame = match capturer.frame(Duration::from_millis(0)) {
+        println!("Waiting for frame from PipeWire...");
+        let frame = match capturer.frame(Duration::from_millis(1000)) {
             Ok(frame) => frame,
             Err(error) => {
                 if error.kind() == WouldBlock {
@@ -52,90 +51,40 @@ fn record(i: usize) {
         let buffer = frame.data();
         println!("Captured data len: {}, Saving...", buffer.len());
 
+        let (actual_w, actual_h) = if buffer.len() == w * h * 4 {
+            (w, h)
+        } else if buffer.len() == 640 * 360 * 4 {
+            println!("Buffer is 640x360 instead of reported {}x{}", w, h);
+            (640, 360)
+        } else {
+            let guessed_h = 360;
+            let guessed_w = buffer.len() / (guessed_h * 4);
+            println!("Guessed resolution: {}x{}", guessed_w, guessed_h);
+            (guessed_w, guessed_h)
+        };
+
         // Flip the BGRA image into a RGBA image.
+        let mut bitflipped = Vec::with_capacity(actual_w * actual_h * 4);
+        let stride = buffer.len() / actual_h;
 
-        let mut bitflipped = Vec::with_capacity(w * h * 4);
-        let stride = buffer.len() / h;
-
-        for y in 0..h {
-            for x in 0..w {
+        for y in 0..actual_h {
+            for x in 0..actual_w {
                 let i = stride * y + 4 * x;
                 bitflipped.extend_from_slice(&[buffer[i + 2], buffer[i + 1], buffer[i], 255]);
             }
         }
 
         // Save the image.
-
         let name = format!("screenshot{}_1.png", i);
         repng::encode(
             File::create(name.clone()).unwrap(),
-            w as u32,
-            h as u32,
+            actual_w as u32,
+            actual_h as u32,
             &bitflipped,
         )
         .unwrap();
 
         println!("Image saved to `{}`.", name);
-        break;
-    }
-
-    drop(capturer);
-    let display = get_display(i);
-    let mut capturer = Capturer::new(display).expect("Couldn't begin capture.");
-    let (w, h) = (capturer.width(), capturer.height());
-
-    loop {
-        // Wait until there's a frame.
-
-        let frame = match capturer.frame(Duration::from_millis(0)) {
-            Ok(frame) => frame,
-            Err(error) => {
-                if error.kind() == WouldBlock {
-                    // Keep spinning.
-                    thread::sleep(one_frame);
-                    continue;
-                } else {
-                    panic!("Error: {}", error);
-                }
-            }
-        };
-        let Frame::PixelBuffer(frame) = frame else {
-            return;
-        };
-        let buffer = frame.data();
-        println!("Captured data len: {}, Saving...", buffer.len());
-
-        let mut raw = Vec::new();
-        unsafe {
-            scrap::ARGBToRAW(
-                buffer.as_ptr(),
-                frame.stride()[0] as _,
-                (&mut raw).as_mut_ptr(),
-                (w * 3) as _,
-                w as _,
-                h as _,
-            )
-        };
-
-        let mut bitflipped = Vec::with_capacity(w * h * 4);
-        let stride = raw.len() / h;
-
-        for y in 0..h {
-            for x in 0..w {
-                let i = stride * y + 3 * x;
-                bitflipped.extend_from_slice(&[raw[i], raw[i + 1], raw[i + 2], 255]);
-            }
-        }
-        let name = format!("screenshot{}_2.png", i);
-        repng::encode(
-            File::create(name.clone()).unwrap(),
-            w as u32,
-            h as u32,
-            &bitflipped,
-        )
-        .unwrap();
-
-        println!("Image saved to `{}`.", name);
-        break;
+        return;
     }
 }

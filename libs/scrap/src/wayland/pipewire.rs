@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
+use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use dbus::{
     arg::{OwnedFd, PropMap, RefArg, Variant},
@@ -24,7 +25,7 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
 use base::platform::linux::CMD_SH;
-use hbb_common::{anyhow::anyhow, bail, config, serde_json, tokio, ResultType};
+use hbb_common::{anyhow::anyhow, bail, config, serde_json, ResultType};
 
 use super::capturable::PixelProvider;
 use super::capturable::{Capturable, Recorder};
@@ -56,6 +57,35 @@ struct PipewireDisplayOffsetCache {
 // KDE Plasma may not provide position info
 static HAS_POSITION_ATTR: AtomicBool = AtomicBool::new(false);
 static IS_SERVER_RUNNING: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1:true, 2: false
+static USE_REMOTE_DESKTOP: AtomicU8 = AtomicU8::new(0); // 0: uninitialized, 1:true, 2: false
+
+pub(crate) fn can_use_remote_desktop_portal(portal: &Proxy<'_, &SyncConnection>) -> bool {
+    if is_server_running() {
+        USE_REMOTE_DESKTOP.store(2, Ordering::SeqCst);
+        return false;
+    }
+    let v = USE_REMOTE_DESKTOP.load(Ordering::SeqCst);
+    if v > 0 {
+        return v == 1;
+    }
+    let use_rdp = match remote_desktop_portal::available_device_types(portal) {
+        Ok(types) if types > 0 => true,
+        _ => {
+            debug!("RemoteDesktop portal has no available device types, falling back to ScreenCast portal");
+            false
+        }
+    };
+    USE_REMOTE_DESKTOP.store(if use_rdp { 1 } else { 2 }, Ordering::SeqCst);
+    use_rdp
+}
+
+pub(crate) fn can_use_remote_desktop_portal_cached() -> bool {
+    let v = USE_REMOTE_DESKTOP.load(Ordering::SeqCst);
+    if v > 0 {
+        return v == 1;
+    }
+    !is_server_running()
+}
 
 impl PipewireDisplayOffsetCache {
     fn displays_to_key(displays: &Arc<Displays>) -> String {
@@ -84,8 +114,8 @@ pub fn try_close_session() {
     let mut rdp_info = RDP_SESSION_INFO.lock().unwrap();
     let mut close = false;
     if let Some(rdp_info) = &*rdp_info {
-        // If is server running and restore token is supported, there's no need to keep the session.
-        if is_server_running() && rdp_info.is_support_restore_token {
+        // If screencast is used and restore token is supported, there's no need to keep the session.
+        if (!can_use_remote_desktop_portal_cached()) && rdp_info.is_support_restore_token {
             close = true;
         }
     }
@@ -99,7 +129,7 @@ pub fn try_close_session() {
 pub struct RdpSessionInfo {
     pub conn: Arc<SyncConnection>,
     pub streams: Vec<PwStreamInfo>,
-    pub fd: OwnedFd,
+    pub fd: Option<OwnedFd>,
     pub session: dbus::Path<'static>,
     pub is_support_restore_token: bool,
     pub resolution: Arc<Mutex<Option<(usize, usize)>>>,
@@ -150,7 +180,7 @@ impl Error for GStreamerError {}
 pub struct PipeWireCapturable {
     // connection needs to be kept alive for recording
     dbus_conn: Arc<SyncConnection>,
-    fd: OwnedFd,
+    fd: Option<OwnedFd>,
     path: u64,
     source_type: u64,
     pub primary: bool,
@@ -162,23 +192,46 @@ pub struct PipeWireCapturable {
 impl PipeWireCapturable {
     fn new(
         conn: Arc<SyncConnection>,
-        fd: OwnedFd,
+        fd: Option<OwnedFd>,
         resolution: Arc<Mutex<Option<(usize, usize)>>>,
         stream: &PwStreamInfo,
     ) -> Self {
-        // alternative to get screen resolution as stream.size is not always correct ex: on fractional scaling
-        // https://github.com/rustdesk/rustdesk/issues/6116#issuecomment-1817724244
-        let physical_size = get_res(Self {
-            dbus_conn: conn.clone(),
-            fd: fd.clone(),
-            path: stream.path,
-            source_type: stream.source_type,
-            primary: false,
-            position: stream.position,
-            logical_size: stream.size,
-            physical_size: (0, 0),
-        })
-        .unwrap_or(stream.size);
+        let displays = super::display::get_displays();
+        let matched = displays
+            .displays
+            .iter()
+            .find(|d| d.x == stream.position.0 && d.y == stream.position.1)
+            .or_else(|| displays.displays.first());
+
+        let physical_size = if let Some(d) = matched {
+            let (w, h) = if d.transform == 90 || d.transform == 270 {
+                (d.height as usize, d.width as usize)
+            } else {
+                (d.width as usize, d.height as usize)
+            };
+            if w > 0 && h > 0 {
+                (w, h)
+            } else if stream.size.0 > 0 && stream.size.1 > 0 {
+                stream.size
+            } else {
+                (1920, 1080)
+            }
+        } else if stream.size.0 > 0 && stream.size.1 > 0 {
+            stream.size
+        } else {
+            get_res(Self {
+                dbus_conn: conn.clone(),
+                fd: fd.clone(),
+                path: stream.path,
+                source_type: stream.source_type,
+                primary: false,
+                position: stream.position,
+                logical_size: stream.size,
+                physical_size: (0, 0),
+            })
+            .unwrap_or(stream.size)
+        };
+        debug!("[pipewire] Resolved capturable size: physical={:?}, logical={:?}", physical_size, stream.size);
         *resolution.lock().unwrap() = Some(physical_size);
         Self {
             dbus_conn: conn,
@@ -199,7 +252,7 @@ impl std::fmt::Debug for PipeWireCapturable {
             f,
             "PipeWireCapturable {{dbus: {}, fd: {}, path: {}, source_type: {}}}",
             self.dbus_conn.unique_name(),
-            self.fd.as_raw_fd(),
+            self.fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1),
             self.path,
             self.source_type
         )
@@ -261,7 +314,96 @@ pub struct PipeWireRecorder {
     appsink: AppSink,
     width: usize,
     height: usize,
-    saved_raw_data: Vec<u8>, // for faster compare and copy
+    saved_raw_data: Vec<u8>,
+    dma_buffer: Vec<u8>,
+}
+
+unsafe fn try_mmap_dmabuf(
+    buf: &gst::Buffer,
+    w: usize,
+    h: usize,
+    out: &mut Vec<u8>,
+) -> Option<()> {
+    if buf.n_memory() == 0 {
+        trace!("[dmabuf] buf.n_memory() == 0");
+        return None;
+    }
+
+    type FnIsDmabuf = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
+    type FnGetFd = unsafe extern "C" fn(*mut std::ffi::c_void) -> std::os::raw::c_int;
+
+    let handle = hbb_common::libc::dlopen(
+        b"libgstallocators-1.0.so.0\0".as_ptr() as *const _,
+        hbb_common::libc::RTLD_LAZY,
+    );
+    if handle.is_null() {
+        debug!("[dmabuf] dlopen failed");
+        return None;
+    }
+
+    let is_dmabuf_sym = hbb_common::libc::dlsym(handle, b"gst_is_dmabuf_memory\0".as_ptr() as *const _);
+    let get_dmabuf_fd_sym = hbb_common::libc::dlsym(handle, b"gst_dmabuf_memory_get_fd\0".as_ptr() as *const _);
+    let is_fd_sym = hbb_common::libc::dlsym(handle, b"gst_is_fd_memory\0".as_ptr() as *const _);
+    let get_fd_sym = hbb_common::libc::dlsym(handle, b"gst_fd_memory_get_fd\0".as_ptr() as *const _);
+
+    let mem_ref = buf.peek_memory(0);
+    let mem = mem_ref.as_ptr() as *mut std::ffi::c_void;
+    if mem.is_null() {
+        trace!("[dmabuf] mem is null");
+        hbb_common::libc::dlclose(handle);
+        return None;
+    }
+
+    let mut dma_fd = -1;
+    if !is_dmabuf_sym.is_null() && !get_dmabuf_fd_sym.is_null() {
+        let is_dmabuf: FnIsDmabuf = std::mem::transmute(is_dmabuf_sym);
+        let ret = is_dmabuf(mem);
+        trace!("[dmabuf] is_dmabuf returned {}", ret);
+        if ret != 0 {
+            let get_fd: FnGetFd = std::mem::transmute(get_dmabuf_fd_sym);
+            dma_fd = get_fd(mem);
+        }
+    }
+
+    if dma_fd < 0 && !is_fd_sym.is_null() && !get_fd_sym.is_null() {
+        let is_fd: FnIsDmabuf = std::mem::transmute(is_fd_sym);
+        let ret = is_fd(mem);
+        trace!("[dmabuf] is_fd returned {}", ret);
+        if ret != 0 {
+            let get_fd: FnGetFd = std::mem::transmute(get_fd_sym);
+            dma_fd = get_fd(mem);
+        }
+    }
+
+    hbb_common::libc::dlclose(handle);
+
+    trace!("[dmabuf] extracted dma_fd: {}", dma_fd);
+    if dma_fd < 0 {
+        return None;
+    }
+
+    let size = w * h * 4;
+    let addr = hbb_common::libc::mmap(
+        std::ptr::null_mut(),
+        size,
+        hbb_common::libc::PROT_READ,
+        hbb_common::libc::MAP_SHARED,
+        dma_fd,
+        0,
+    );
+
+    if addr == hbb_common::libc::MAP_FAILED {
+        warn!("[dmabuf] mmap failed: {}", std::io::Error::last_os_error());
+        return None;
+    }
+
+    trace!("[dmabuf] mmap succeeded: addr={:?}, size={}", addr, size);
+    let slice = std::slice::from_raw_parts(addr as *const u8, size);
+    out.clear();
+    out.extend_from_slice(slice);
+    hbb_common::libc::munmap(addr, size);
+
+    Some(())
 }
 
 // Element creation fails the same way for a plugin that is not installed as for one that is
@@ -279,77 +421,81 @@ impl PipeWireRecorder {
         let pipeline = gst::Pipeline::new(None);
 
         let src = gst_element("pipewiresrc")?;
-        src.set_property("fd", &capturable.fd.as_raw_fd())?;
+        if let Some(ref fd) = capturable.fd {
+            let raw_fd = fd.as_raw_fd();
+            let dup_fd = unsafe { hbb_common::libc::dup(raw_fd) };
+            if dup_fd >= 0 {
+                debug!("[gstreamer] Bound pipewiresrc with dup_fd: {} (orig: {}), path: {}", dup_fd, raw_fd, capturable.path);
+                src.set_property("fd", &dup_fd)?;
+            }
+        } else {
+            debug!("[gstreamer] Bound pipewiresrc directly via path: {}", capturable.path);
+        }
         src.set_property("path", &format!("{}", capturable.path))?;
-        src.set_property("keepalive_time", &1_000.as_raw_fd())?;
-
-        // For some reason pipewire blocks on destruction of AppSink if this is not set to true,
-        // see: https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/982
-        src.set_property("always-copy", &true)?;
-
-        // COSMIC/Wayland fix: insert videoconvert between pipewiresrc and appsink.
-        // xdg-desktop-portal-cosmic's modifier negotiation fails when the downstream
-        // format set is too narrow (appsink only accepts BGRx/RGBx), producing
-        // "no more output formats" / not-negotiated (-4). videoconvert accepts any
-        // system-memory video/x-raw format, widening negotiation so the portal can
-        // settle on a format it can deliver via its SHM path.
-        let convert = gst_element("videoconvert")?;
+        let _ = src.set_property("keepalive-time", &1000i32);
 
         let sink = gst_element("appsink")?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
 
-        pipeline.add_many(&[&src, &convert, &sink])?;
-        src.link(&convert)?;
-        convert.link(&sink)?;
-
+        pipeline.add_many(&[&src, &sink])?;
+        src.link(&sink)?;
         let appsink = sink
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
-        let mut caps = gst::Caps::new_empty();
-        caps.merge_structure(gst::structure::Structure::new(
-            "video/x-raw",
-            &[("format", &"BGRx")],
-        ));
-        caps.merge_structure(gst::structure::Structure::new(
-            "video/x-raw",
-            &[("format", &"RGBx")],
-        ));
-        appsink.set_caps(Some(&caps));
+
+        let caps = if capturable.physical_size.0 > 0 && capturable.physical_size.1 > 0 {
+            let (w, h) = (
+                capturable.physical_size.0 as i32,
+                capturable.physical_size.1 as i32,
+            );
+            debug!("[gstreamer] Constraining appsink caps to {}x{}", w, h);
+            let caps_str = format!(
+                "video/x-raw(memory:DMABuf),format=BGRx,width={w},height={h},framerate=0/1; \
+                 video/x-raw(memory:DMABuf),format=RGBx,width={w},height={h},framerate=0/1; \
+                 video/x-raw,format=BGRx,width={w},height={h}; \
+                 video/x-raw,format=RGBx,width={w},height={h}"
+            );
+            gst::Caps::from_str(&caps_str).ok()
+        } else {
+            let caps_str = "\
+                video/x-raw(memory:DMABuf),format=BGRx,framerate=0/1; \
+                video/x-raw(memory:DMABuf),format=RGBx,framerate=0/1; \
+                video/x-raw,format=BGRx; \
+                video/x-raw,format=RGBx";
+            gst::Caps::from_str(caps_str).ok()
+        };
+        appsink.set_caps(caps.as_ref());
 
         // [Workaround]
         // Crash may occur if there are multiple pipelines started at the same time.
         // `pipeline.get_state()` can significantly reduce the probability of crashes,
         // but cannot completely resolve this issue.
         // Adding a short sleep period can also reduce the probability of crashes.
-        debug!(
-            "[gstreamer] Setting pipeline {} to PLAYING state...",
-            capturable.fd.as_raw_fd()
-        );
+        debug!("[gstreamer] Setting pipeline to PLAYING state...");
         pipeline.set_state(gst::State::Playing)?;
+        trace!("[gstreamer] set_state called, waiting for state change...");
 
-        // If `is_server_running()` is false, it means using remote_desktop_portal,
-        // which does not use multiple streams, so no need to wait for state change.
-        if is_server_running() {
+        // If using screencast_portal (multiple streams possible), wait for state change.
+        if !can_use_remote_desktop_portal_cached() {
             // Wait for the state change to actually complete before proceeding.
             // The 2000ms timeout for pipeline state change was chosen based on empirical testing.
             let state_change = pipeline.get_state(gst::ClockTime::from_mseconds(2000));
+            trace!("[gstreamer] pipeline state_change result: {:?}", state_change);
             match state_change {
                 (Ok(_), gst::State::Playing, _) => {
-                    debug!(
-                        "[gstreamer] Pipeline {} state confirmed as PLAYING.",
-                        capturable.fd.as_raw_fd()
-                    );
+                    debug!("[gstreamer] Pipeline state confirmed as PLAYING.");
                 }
                 (result, state, pending) => {
                     warn!(
-                    "[gstreamer] Pipeline {} state change incomplete: result={:?}, state={:?}, pending={:?}",
-                    capturable.fd.as_raw_fd(), result, state, pending
-                );
+                        "[gstreamer] Pipeline state change incomplete: result={:?}, state={:?}, pending={:?}",
+                        result, state, pending
+                    );
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(150));
         }
+        debug!("[gstreamer] PipeWireRecorder initialized successfully.");
 
         Ok(Self {
             pipeline,
@@ -361,6 +507,7 @@ impl PipeWireRecorder {
             buffer_cropped: vec![],
             is_cropped: false,
             saved_raw_data: Vec::new(),
+            dma_buffer: Vec::new(),
         })
     }
 }
@@ -395,40 +542,23 @@ impl Recorder for PipeWireRecorder {
             if Some((0, 0, w as u32, h as u32)) == crop {
                 crop = None;
             }
-            let buf = buf
-                .into_mapped_buffer_readable()
-                .map_err(|_| GStreamerError("Failed to map buffer.".into()))?;
-            if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, buf.as_slice()) {
-                return Ok(PixelProvider::NONE);
-            }
-            let buf_size = buf.get_size();
-            // BGRx is 4 bytes per pixel
-            if buf_size != (w * h * 4) {
-                // for some reason the width and height of the caps do not guarantee correct buffer
-                // size, so ignore those buffers, see:
-                // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
-                trace!(
-                    "Size of mapped buffer: {} does NOT match size of capturable {}x{}@BGRx, \
-                    dropping it!",
-                    buf_size,
-                    w,
-                    h
-                );
-            } else {
-                // Copy region specified by crop into self.buffer_cropped
-                // TODO: Figure out if ffmpeg provides a zero copy alternative
+            // Check if buffer is DMA-BUF
+            let is_dma = unsafe { try_mmap_dmabuf(&buf, w, h, &mut self.dma_buffer) };
+            if is_dma.is_some() {
+                self.buffer = None;
+                if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, &self.dma_buffer) {
+                    return Ok(PixelProvider::NONE);
+                }
                 if let Some((x_off, y_off, w_crop, h_crop)) = crop {
                     let x_off = x_off as usize;
                     let y_off = y_off as usize;
                     let w_crop = w_crop as usize;
                     let h_crop = h_crop as usize;
                     self.buffer_cropped.clear();
-                    let data = buf.as_slice();
-                    // BGRx is 4 bytes per pixel
                     self.buffer_cropped.reserve(w_crop * h_crop * 4);
                     for y in y_off..(y_off + h_crop) {
                         let i = 4 * (w * y + x_off);
-                        self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
+                        self.buffer_cropped.extend_from_slice(&self.dma_buffer[i..i + 4 * w_crop]);
                     }
                     self.width = w_crop;
                     self.height = h_crop;
@@ -437,16 +567,62 @@ impl Recorder for PipeWireRecorder {
                     self.height = h;
                 }
                 self.is_cropped = crop.is_some();
-                self.buffer = Some(buf);
+            } else {
+                let buf = buf
+                    .into_mapped_buffer_readable()
+                    .map_err(|_| GStreamerError("Failed to map buffer.".into()))?;
+                if let Err(..) = crate::would_block_if_equal(&mut self.saved_raw_data, buf.as_slice()) {
+                    return Ok(PixelProvider::NONE);
+                }
+                let buf_size = buf.get_size();
+                // BGRx is 4 bytes per pixel
+                if buf_size != (w * h * 4) {
+                    // for some reason the width and height of the caps do not guarantee correct buffer
+                    // size, so ignore those buffers, see:
+                    // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/985
+                    trace!(
+                        "Size of mapped buffer: {} does NOT match size of capturable {}x{}@BGRx, \
+                        dropping it!",
+                        buf_size,
+                        w,
+                        h
+                    );
+                } else {
+                    // Copy region specified by crop into self.buffer_cropped
+                    // TODO: Figure out if ffmpeg provides a zero copy alternative
+                    if let Some((x_off, y_off, w_crop, h_crop)) = crop {
+                        let x_off = x_off as usize;
+                        let y_off = y_off as usize;
+                        let w_crop = w_crop as usize;
+                        let h_crop = h_crop as usize;
+                        self.buffer_cropped.clear();
+                        let data = buf.as_slice();
+                        // BGRx is 4 bytes per pixel
+                        self.buffer_cropped.reserve(w_crop * h_crop * 4);
+                        for y in y_off..(y_off + h_crop) {
+                            let i = 4 * (w * y + x_off);
+                            self.buffer_cropped.extend(&data[i..i + 4 * w_crop]);
+                        }
+                        self.width = w_crop;
+                        self.height = h_crop;
+                    } else {
+                        self.width = w;
+                        self.height = h;
+                    }
+                    self.is_cropped = crop.is_some();
+                    self.buffer = Some(buf);
+                }
             }
         } else {
             return Ok(PixelProvider::NONE);
         }
-        if self.buffer.is_none() {
+        if self.buffer.is_none() && self.dma_buffer.is_empty() {
             return Err(Box::new(GStreamerError("No buffer available!".into())));
         }
-        let buf = if self.is_cropped {
+        let buf: &[u8] = if self.is_cropped {
             self.buffer_cropped.as_slice()
+        } else if !self.dma_buffer.is_empty() && self.buffer.is_none() {
+            self.dma_buffer.as_slice()
         } else {
             self.buffer
                 .as_ref()
@@ -668,6 +844,7 @@ pub fn get_portal(conn: &SyncConnection) -> Proxy<&SyncConnection> {
 }
 
 fn streams_from_response(response: OrgFreedesktopPortalRequestResponse) -> Vec<PwStreamInfo> {
+    debug!("Portal streams response: {:?}", response.results);
     (move || {
         Some(
             response
@@ -757,6 +934,122 @@ pub fn get_available_cursor_modes() -> Result<u32, dbus::Error> {
     portal.available_cursor_modes()
 }
 
+pub fn try_mutter_screencast() -> ResultType<(
+    SyncConnection,
+    Option<OwnedFd>,
+    Vec<PwStreamInfo>,
+    dbus::Path<'static>,
+    bool,
+)> {
+    unsafe {
+        if !INIT {
+            gstreamer::init()?;
+            INIT = true;
+        }
+    }
+    let conn = SyncConnection::new_session()
+        .map_err(|e| anyhow!("Failed to connect to session bus: {}", e))?;
+
+    let proxy = conn.with_proxy(
+        "org.gnome.Mutter.ScreenCast",
+        "/org/gnome/Mutter/ScreenCast",
+        Duration::from_millis(1000),
+    );
+
+    let (session_path,): (dbus::Path<'static>,) = proxy
+        .method_call(
+            "org.gnome.Mutter.ScreenCast",
+            "CreateSession",
+            (HashMap::<String, Variant<Box<dyn RefArg>>>::new(),),
+        )
+        .map_err(|e| anyhow!("CreateSession on Mutter failed: {}", e))?;
+
+    debug!("[mutter] Created Mutter ScreenCast session: {}", session_path);
+
+    let session_proxy = conn.with_proxy(
+        "org.gnome.Mutter.ScreenCast",
+        &session_path,
+        Duration::from_millis(2000),
+    );
+
+    let wayland_displays = super::display::get_displays();
+    let mut connectors = Vec::new();
+    for d in wayland_displays.displays.iter() {
+        if !d.name.is_empty() {
+            connectors.push(d.name.clone());
+        }
+    }
+    if connectors.is_empty() {
+        connectors.push("eDP-1".to_string());
+    }
+
+    let node_id_arc: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let node_id_res = node_id_arc.clone();
+
+    let mut m = MatchRule::new();
+    m.msg_type = Some(MessageType::Signal);
+    m.interface = Some("org.gnome.Mutter.ScreenCast.Stream".into());
+    m.member = Some("PipeWireStreamAdded".into());
+    conn.add_match(m, move |(node_id,): (u32,), _: &SyncConnection, _: &Message| {
+        debug!("[mutter] Received PipeWireStreamAdded signal: node_id={}", node_id);
+        *node_id_res.lock().unwrap() = Some(node_id);
+        true
+    })
+    .map_err(|e| anyhow!("Failed to add match for PipeWireStreamAdded: {}", e))?;
+
+    for conn_name in &connectors {
+        let (stream_path,): (dbus::Path<'static>,) = session_proxy
+            .method_call(
+                "org.gnome.Mutter.ScreenCast.Session",
+                "RecordMonitor",
+                (conn_name, HashMap::<String, Variant<Box<dyn RefArg>>>::new()),
+            )
+            .map_err(|e| anyhow!("RecordMonitor for {} failed: {}", conn_name, e))?;
+        debug!("[mutter] Recorded monitor {} -> stream: {}", conn_name, stream_path);
+    }
+
+    let (): () = session_proxy
+        .method_call(
+            "org.gnome.Mutter.ScreenCast.Session",
+            "Start",
+            (),
+        )
+        .map_err(|e| anyhow!("Start session failed: {}", e))?;
+
+    for _ in 0..30 {
+        conn.process(Duration::from_millis(100))
+            .map_err(|e| anyhow!("D-Bus process error: {}", e))?;
+        if node_id_arc.lock().unwrap().is_some() {
+            break;
+        }
+    }
+
+    let node_id = node_id_arc
+        .lock()
+        .unwrap()
+        .ok_or_else(|| anyhow!("Timed out waiting for PipeWireStreamAdded from Mutter"))?;
+
+    let primary_display = wayland_displays.displays.first();
+    let size = primary_display
+        .map(|d| {
+            if d.transform == 90 || d.transform == 270 {
+                (d.height as usize, d.width as usize)
+            } else {
+                (d.width as usize, d.height as usize)
+            }
+        })
+        .unwrap_or((3840, 2160));
+
+    let streams = vec![PwStreamInfo {
+        path: node_id as u64,
+        size,
+        position: (0, 0),
+        source_type: 1,
+    }];
+
+    Ok((conn, None, streams, session_path, false))
+}
+
 // mostly inspired by https://gitlab.gnome.org/-/snippets/39
 pub fn request_remote_desktop(
     capture_cursor: bool,
@@ -824,7 +1117,8 @@ pub fn request_remote_desktop(
         PortalStage::CreateSession,
     )
     .map_err(|e| anyhow!(dbus_stage_err("create-session", &e)))?;
-    if is_server_running() {
+    let use_rdp = can_use_remote_desktop_portal(&portal);
+    if !use_rdp {
         let _ = screencast_portal::create_session(&portal, args)
             .map_err(|e| anyhow!(dbus_stage_err("create-session", &e)))?;
     } else {
@@ -907,8 +1201,8 @@ fn on_create_session_response(
 
         let portal = get_portal(c);
         let mut args: PropMap = HashMap::new();
-        // See `is_server_running()` to understand the following code.
-        if is_server_running() {
+        let use_rdp = can_use_remote_desktop_portal(&portal);
+        if !use_rdp {
             if is_support_restore_token {
                 let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
                 if !restore_token.is_empty() {
@@ -923,9 +1217,7 @@ fn on_create_session_response(
                 Variant(Box::new(select_sources_handle_token.to_string())),
             );
             // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html
-            if is_server_running() {
-                args.insert("multiple".into(), Variant(Box::new(true)));
-            }
+            args.insert("multiple".into(), Variant(Box::new(true)));
             args.insert("types".into(), Variant(Box::new(1u32))); //| 2u32)));
 
             if capture_cursor {
@@ -1007,7 +1299,7 @@ fn on_select_devices_response(
             Variant(Box::new(select_sources_handle_token.to_string())),
         );
         // https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html
-        if is_server_running() {
+        if !can_use_remote_desktop_portal_cached() {
             args.insert("multiple".into(), Variant(Box::new(true)));
         }
         args.insert("types".into(), Variant(Box::new(1u32))); //| 2u32)));
@@ -1068,7 +1360,8 @@ fn on_select_sources_response(
             trace.clone(),
             PortalStage::Start,
         )?;
-        if is_server_running() {
+        let use_rdp = can_use_remote_desktop_portal(&portal);
+        if !use_rdp {
             let _ = screencast_portal::start(&portal, session.clone(), "", args)
                 .map_err(|e| DBusError(dbus_stage_err("start", &e)))?;
         } else {
@@ -1093,8 +1386,8 @@ fn on_start_response(
 ) -> Result<(), Box<dyn Error>> {
     move |r: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
-        // See `is_server_running()` to understand the following code.
-        if is_server_running() {
+        let use_rdp = can_use_remote_desktop_portal(&portal);
+        if !use_rdp {
             if is_support_restore_token {
                 if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
                     if let Some(restore_token) = restore_token.as_str() {
@@ -1132,7 +1425,17 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     };
 
     if rdp_connection.is_none() {
-        let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
+        let (conn, fd, streams, session, is_support_restore_token) = match try_mutter_screencast() {
+            Ok(tuple) => {
+                info!("[pipewire] Using direct Mutter ScreenCast (promptless)");
+                tuple
+            }
+            Err(e) => {
+                debug!("[pipewire] Mutter ScreenCast unavailable ({}), falling back to portal", e);
+                let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
+                (conn, Some(fd), streams, session, is_support_restore_token)
+            }
+        };
         let conn = Arc::new(conn);
 
         let rdp_info = RdpSessionInfo {
@@ -1596,7 +1899,7 @@ fn fill_multi_matched_positions_cursor(
 
                 let mut rec = PipeWireRecorder::new(PipeWireCapturable {
                     dbus_conn: conn.clone(),
-                    fd: fd.clone(),
+                    fd: Some(fd.clone()),
                     path: pw_stream_with_cursor.path,
                     source_type: pw_stream_with_cursor.source_type,
                     primary: false,
