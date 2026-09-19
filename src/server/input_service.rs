@@ -488,7 +488,7 @@ enum KeysDown {
 }
 
 lazy_static::lazy_static! {
-    static ref ENIGO: Arc<Mutex<Enigo>> = {
+    pub static ref ENIGO: Arc<Mutex<Enigo>> = {
         Arc::new(Mutex::new(Enigo::new()))
     };
     static ref KEYS_DOWN: Arc<Mutex<HashMap<KeysDown, Instant>>> = Default::default();
@@ -653,24 +653,58 @@ static mut VIRTUAL_INPUT_STATE: Option<VirtualInputState> = None;
 // Thus this function must not be called in a temporary runtime.
 #[cfg(target_os = "linux")]
 pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
-    // Keyboard and mouse both open /dev/uinput
-    // TODO: Make sure there's no race
-    set_uinput_resolution(minx, maxx, miny, maxy).await?;
+    // 1. Try service IPC first (if rustdesk --service is running as root)
+    let service_ok = if let Ok(()) = set_uinput_resolution(minx, maxx, miny, maxy).await {
+        if let (Ok(keyboard), Ok(mouse)) = (
+            super::uinput::client::UInputKeyboard::new().await,
+            super::uinput::client::UInputMouse::new().await,
+        ) {
+            log::info!("UInput keyboard & mouse created via service IPC");
+            let mut en = ENIGO.lock().unwrap();
+            en.set_is_x11(false);
+            en.set_custom_keyboard(Box::new(keyboard));
+            en.set_custom_mouse(Box::new(mouse));
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
-    let keyboard = super::uinput::client::UInputKeyboard::new().await?;
-    log::info!("UInput keyboard created");
-    let mouse = super::uinput::client::UInputMouse::new().await?;
-    log::info!("UInput mouse created");
+    if service_ok {
+        return Ok(());
+    }
 
-    let mut en = ENIGO.lock().unwrap();
-    // enigo guessed x11 once at construction, which is what a Wayland greeter reads as, and
-    // then routes the devices installed below to a null xdo that drops everything silently.
-    // Reaching here means `wayland_use_uinput()` was true, so this states a fact.
-    en.set_is_x11(false);
-    // One lock for both, so there is no window where the keyboard is custom and the mouse is not.
-    en.set_custom_keyboard(Box::new(keyboard));
-    en.set_custom_mouse(Box::new(mouse));
-    Ok(())
+    // 2. Direct uinput creation (when /dev/uinput is directly writable by current process)
+    log::info!("Service IPC unavailable for uinput, attempting direct /dev/uinput creation...");
+    let direct_k = super::uinput::direct::DirectUInputKeyboard::new();
+    let direct_m = super::uinput::direct::DirectUInputMouse::new((minx, maxx), (miny, maxy));
+    match (direct_k, direct_m) {
+        (Ok(keyboard), Ok(mouse)) => {
+            log::info!("Direct UInput keyboard & mouse created successfully in current process!");
+            let mut en = ENIGO.lock().unwrap();
+            en.set_is_x11(false);
+            en.set_custom_keyboard(Box::new(keyboard));
+            en.set_custom_mouse(Box::new(mouse));
+            return Ok(());
+        }
+        (Err(ref e), _) => {
+            log::warn!("Direct /dev/uinput keyboard creation failed: {}", e);
+        }
+        (_, Err(ref e)) => {
+            log::warn!("Direct /dev/uinput mouse creation failed: {}", e);
+        }
+    }
+
+    // 3. Fallback to RemoteDesktop portal if available
+    log::info!("UInput unavailable, attempting RemoteDesktop portal input fallback...");
+    if let Ok(()) = setup_rdp_input().await {
+        log::info!("RemoteDesktop portal input created as fallback");
+        return Ok(());
+    }
+
+    bail!("Failed to setup any Wayland input backend (service uinput, direct uinput, or RDP portal)");
 }
 
 #[cfg(target_os = "linux")]
@@ -706,19 +740,26 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
 
 #[cfg(target_os = "linux")]
 pub async fn update_mouse_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
-    set_uinput_resolution(minx, maxx, miny, maxy).await?;
+    let _ = set_uinput_resolution(minx, maxx, miny, maxy).await;
 
     // Confirm the device adopted the new range before the caller caches it.
     // spawn_blocking because ENIGO is a std Mutex and send_refresh blocks on IPC.
     tokio::task::spawn_blocking(move || {
-        if let Some(mouse) = ENIGO.lock().unwrap().get_custom_mouse() {
+        let mut en = ENIGO.lock().unwrap();
+        if let Some(mouse) = en.get_custom_mouse() {
             if let Some(mouse) = mouse
                 .as_mut_any()
                 .downcast_mut::<super::uinput::client::UInputMouse>()
             {
                 return mouse.send_refresh();
             }
-            bail!("failed to downcast custom mouse to UInputMouse");
+            if let Some(mouse) = mouse
+                .as_mut_any()
+                .downcast_mut::<super::uinput::direct::DirectUInputMouse>()
+            {
+                return mouse.refresh((minx, maxx), (miny, maxy));
+            }
+            bail!("failed to downcast custom mouse to UInputMouse or DirectUInputMouse");
         }
         // No custom mouse: nothing to refresh.
         Ok(())
@@ -2373,16 +2414,24 @@ async fn send_sas() -> ResultType<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn can_use_uinput() -> bool {
+    if std::fs::OpenOptions::new().write(true).open("/dev/uinput").is_ok() {
+        return true;
+    }
+    crate::is_server()
+}
+
 #[inline]
 #[cfg(target_os = "linux")]
 pub fn wayland_use_uinput() -> bool {
-    !crate::platform::is_x11() && crate::is_server()
+    !crate::platform::is_x11() && (crate::is_server() || can_use_uinput())
 }
 
 #[inline]
 #[cfg(target_os = "linux")]
 pub fn wayland_use_rdp_input() -> bool {
-    !crate::platform::is_x11() && !crate::is_server()
+    !crate::platform::is_x11() && !can_use_uinput()
 }
 
 #[cfg(target_os = "linux")]

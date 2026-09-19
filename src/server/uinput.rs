@@ -395,7 +395,7 @@ pub mod service {
     /// Non-ASCII chars: skipped — this runs in the --service (root) process where clipboard
     /// operations are unreliable (typically no user session environment).
     /// Non-ASCII input is normally handled by the --server process via input_text_via_clipboard_server.
-    fn input_text_wayland(text: &str, keyboard: &mut VirtualDevice) {
+    pub(crate) fn input_text_wayland(text: &str, keyboard: &mut VirtualDevice) {
         let portal_info = {
             let session_info = RDP_SESSION_INFO.lock().unwrap();
             session_info
@@ -456,7 +456,7 @@ pub mod service {
     /// Send a single key down or up event for a Layout character.
     /// Used by KeyDown/KeyUp to maintain correct press/release semantics.
     /// `down`: true for key press, false for key release.
-    fn input_char_wayland_key_event(chr: char, down: bool, keyboard: &mut VirtualDevice) {
+    pub(crate) fn input_char_wayland_key_event(chr: char, down: bool, keyboard: &mut VirtualDevice) {
         let keysym = char_to_keysym(chr);
         let portal_state: u32 = if down { 1 } else { 0 };
 
@@ -539,7 +539,7 @@ pub mod service {
         }
     }
 
-    fn create_uinput_keyboard() -> ResultType<VirtualDevice> {
+    pub(crate) fn create_uinput_keyboard() -> ResultType<VirtualDevice> {
         // TODO: ensure keys here
         let mut keys = AttributeSet::<evdev::Key>::new();
         for i in evdev::Key::KEY_ESC.code()..(evdev::Key::BTN_TRIGGER_HAPPY40.code() + 1) {
@@ -1024,8 +1024,244 @@ pub mod service {
     }
 }
 
+pub mod direct {
+    use super::*;
+    use enigo::{Key, KeyboardControllable, MouseButton, MouseControllable};
+    use evdev::uinput::VirtualDevice;
+    use hbb_common::anyhow;
+    use std::sync::Mutex;
+
+    pub struct DirectUInputKeyboard {
+        manager: Mutex<mouce::UInputKeyboardManager>,
+        modifiers: Mutex<ModifierState>,
+    }
+
+    #[derive(Default)]
+    struct ModifierState {
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+        caps_lock: bool,
+        num_lock: bool,
+    }
+
+    impl DirectUInputKeyboard {
+        pub fn new() -> ResultType<Self> {
+            let manager = mouce::UInputKeyboardManager::new()
+                .map_err(|e| anyhow::anyhow!("Failed to create direct UInputKeyboardManager: {}", e))?;
+            Ok(Self {
+                manager: Mutex::new(manager),
+                modifiers: Mutex::new(ModifierState::default()),
+            })
+        }
+    }
+
+    impl KeyboardControllable for DirectUInputKeyboard {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn get_key_state(&mut self, key: Key) -> bool {
+            if let Ok(m) = self.modifiers.lock() {
+                match key {
+                    Key::Shift => m.shift,
+                    Key::Control => m.ctrl,
+                    Key::Alt => m.alt,
+                    Key::Meta => m.meta,
+                    Key::CapsLock => m.caps_lock,
+                    Key::NumLock => m.num_lock,
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+
+        fn key_sequence(&mut self, sequence: &str) {
+            for c in sequence.chars() {
+                self.key_click(Key::Layout(c));
+            }
+        }
+
+        fn key_down(&mut self, key: Key) -> enigo::ResultType {
+            if let Ok(mut mods) = self.modifiers.lock() {
+                match key {
+                    Key::Shift => mods.shift = true,
+                    Key::Control => mods.ctrl = true,
+                    Key::Alt => mods.alt = true,
+                    Key::Meta => mods.meta = true,
+                    Key::CapsLock => mods.caps_lock = !mods.caps_lock,
+                    Key::NumLock => mods.num_lock = !mods.num_lock,
+                    _ => {}
+                }
+            }
+            if let Ok(m) = self.manager.lock() {
+                match key {
+                    Key::Raw(code) => {
+                        if code >= 8 {
+                            allow_err!(m.key_down(code - 8));
+                        }
+                    }
+                    _ => {
+                        if let Ok((k, is_shift)) = service::map_key(&key) {
+                            if is_shift {
+                                allow_err!(m.key_down(evdev::Key::KEY_LEFTSHIFT.code()));
+                            }
+                            allow_err!(m.key_down(k.code()));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn key_up(&mut self, key: Key) {
+            if let Ok(mut mods) = self.modifiers.lock() {
+                match key {
+                    Key::Shift => mods.shift = false,
+                    Key::Control => mods.ctrl = false,
+                    Key::Alt => mods.alt = false,
+                    Key::Meta => mods.meta = false,
+                    _ => {}
+                }
+            }
+            if let Ok(m) = self.manager.lock() {
+                match key {
+                    Key::Raw(code) => {
+                        if code >= 8 {
+                            allow_err!(m.key_up(code - 8));
+                        }
+                    }
+                    _ => {
+                        if let Ok((k, is_shift)) = service::map_key(&key) {
+                            allow_err!(m.key_up(k.code()));
+                            if is_shift {
+                                allow_err!(m.key_up(evdev::Key::KEY_LEFTSHIFT.code()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn key_click(&mut self, key: Key) {
+            let _ = self.key_down(key.clone());
+            self.key_up(key);
+        }
+    }
+
+    pub struct DirectUInputMouse {
+        manager: Mutex<mouce::UInputMouseManager>,
+    }
+
+    impl DirectUInputMouse {
+        pub fn new(rng_x: (i32, i32), rng_y: (i32, i32)) -> ResultType<Self> {
+            let manager = mouce::UInputMouseManager::new(rng_x, rng_y)
+                .map_err(|e| anyhow::anyhow!("Failed to create direct UInputMouseManager: {}", e))?;
+            Ok(Self {
+                manager: Mutex::new(manager),
+            })
+        }
+
+        pub fn refresh(&self, rng_x: (i32, i32), rng_y: (i32, i32)) -> ResultType<()> {
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Mutex poisoned: {}", e))?;
+            *manager = mouce::UInputMouseManager::new(rng_x, rng_y)
+                .map_err(|e| anyhow::anyhow!("Failed to refresh direct UInputMouseManager: {}", e))?;
+            Ok(())
+        }
+    }
+
+    impl MouseControllable for DirectUInputMouse {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_mut_any(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn mouse_move_to(&mut self, x: i32, y: i32) {
+            if let Ok(m) = self.manager.lock() {
+                allow_err!(m.move_to(x as _, y as _));
+            }
+        }
+
+        fn mouse_move_relative(&mut self, x: i32, y: i32) {
+            if let Ok(m) = self.manager.lock() {
+                allow_err!(m.move_relative(x, y));
+            }
+        }
+
+        fn mouse_down(&mut self, button: MouseButton) -> enigo::ResultType {
+            if let Ok(m) = self.manager.lock() {
+                let btn = match button {
+                    MouseButton::Left => mouce::MouseButton::Left,
+                    MouseButton::Middle => mouce::MouseButton::Middle,
+                    MouseButton::Right => mouce::MouseButton::Right,
+                    _ => return Ok(()),
+                };
+                allow_err!(m.press_button(&btn));
+            }
+            Ok(())
+        }
+
+        fn mouse_up(&mut self, button: MouseButton) {
+            if let Ok(m) = self.manager.lock() {
+                let btn = match button {
+                    MouseButton::Left => mouce::MouseButton::Left,
+                    MouseButton::Middle => mouce::MouseButton::Middle,
+                    MouseButton::Right => mouce::MouseButton::Right,
+                    _ => return,
+                };
+                allow_err!(m.release_button(&btn));
+            }
+        }
+
+        fn mouse_click(&mut self, button: MouseButton) {
+            if let Ok(m) = self.manager.lock() {
+                let btn = match button {
+                    MouseButton::Left => mouce::MouseButton::Left,
+                    MouseButton::Middle => mouce::MouseButton::Middle,
+                    MouseButton::Right => mouce::MouseButton::Right,
+                    _ => return,
+                };
+                allow_err!(m.click_button(&btn));
+            }
+        }
+
+        fn mouse_scroll_x(&mut self, _length: i32) {
+            // Horizontal scroll not currently supported
+        }
+
+        fn mouse_scroll_y(&mut self, length: i32) {
+            if let Ok(m) = self.manager.lock() {
+                let mut len = length;
+                let scroll = if len < 0 {
+                    mouce::ScrollDirection::Up
+                } else {
+                    mouce::ScrollDirection::Down
+                };
+                if len < 0 {
+                    len = -len;
+                }
+                for _ in 0..len {
+                    allow_err!(m.scroll_wheel(&scroll));
+                }
+            }
+        }
+    }
+}
+
 // https://github.com/emrebicer/mouce
-mod mouce {
+pub(crate) mod mouce {
     use std::{
         fs::File,
         io::{Error, ErrorKind, Result},
@@ -1361,6 +1597,107 @@ mod mouce {
             let fd = self.uinput_file.as_raw_fd();
             unsafe {
                 // Destroy the device, the file is closed automatically by the File module
+                ioctl(fd, UI_DEV_DESTROY as c_ulong);
+            }
+        }
+    }
+
+    pub struct UInputKeyboardManager {
+        uinput_file: File,
+    }
+
+    impl UInputKeyboardManager {
+        pub fn new() -> Result<Self> {
+            let manager = UInputKeyboardManager {
+                uinput_file: File::options()
+                    .write(true)
+                    .custom_flags(O_NONBLOCK)
+                    .open("/dev/uinput")?,
+            };
+            let fd = manager.uinput_file.as_raw_fd();
+            unsafe {
+                ioctl(fd, UI_SET_EVBIT, EV_KEY);
+                ioctl(fd, UI_SET_EVBIT, EV_SYN);
+                for key in 1..=512 {
+                    ioctl(fd, UI_SET_KEYBIT, key);
+                }
+
+                let mut usetup = UInputSetup {
+                    id: InputId {
+                        bustype: BUS_USB,
+                        vendor: 0x2222,
+                        product: 0x3334,
+                        version: 1,
+                    },
+                    name: [0; UINPUT_MAX_NAME_SIZE],
+                    ff_effects_max: 0,
+                };
+                let name_bytes: Vec<c_char> = "RustDesk-Direct-Keyboard"
+                    .chars()
+                    .map(|ch| ch as c_char)
+                    .collect();
+                for (i, &b) in name_bytes.iter().enumerate() {
+                    if i < UINPUT_MAX_NAME_SIZE - 1 {
+                        usetup.name[i] = b;
+                    }
+                }
+                ioctl(fd, UI_DEV_SETUP, &usetup);
+                ioctl(fd, UI_DEV_CREATE);
+            }
+            thread::sleep(Duration::from_millis(300));
+            Ok(manager)
+        }
+
+        fn emit(&self, r#type: c_int, code: c_int, value: c_int) -> Result<()> {
+            let mut event = InputEvent {
+                time: TimeVal {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                r#type: r#type as c_ushort,
+                code: code as c_ushort,
+                value,
+            };
+            let fd = self.uinput_file.as_raw_fd();
+            unsafe {
+                let count = size_of::<InputEvent>();
+                let written_bytes = write(fd, &mut event, count);
+                if written_bytes == -1 || written_bytes != count as c_long {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        "failed while trying to write to uinput keyboard",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn syncronize(&self) -> Result<()> {
+            self.emit(EV_SYN, SYN_REPORT, 0)?;
+            thread::sleep(Duration::from_millis(1));
+            Ok(())
+        }
+
+        pub fn key_down(&self, code: u16) -> Result<()> {
+            self.emit(EV_KEY, code as c_int, 1)?;
+            self.syncronize()
+        }
+
+        pub fn key_up(&self, code: u16) -> Result<()> {
+            self.emit(EV_KEY, code as c_int, 0)?;
+            self.syncronize()
+        }
+
+        pub fn key_click(&self, code: u16) -> Result<()> {
+            self.key_down(code)?;
+            self.key_up(code)
+        }
+    }
+
+    impl Drop for UInputKeyboardManager {
+        fn drop(&mut self) {
+            let fd = self.uinput_file.as_raw_fd();
+            unsafe {
                 ioctl(fd, UI_DEV_DESTROY as c_ulong);
             }
         }
