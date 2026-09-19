@@ -422,7 +422,7 @@ fn check_uac_switch(privacy_mode_id: i32, capturer_privacy_mode_id: i32) -> Resu
     Ok(())
 }
 
-pub(super) struct CapturerInfo {
+pub struct CapturerInfo {
     pub origin: (i32, i32),
     pub width: usize,
     pub height: usize,

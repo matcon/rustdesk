@@ -43,7 +43,7 @@ mod clipboard_service;
 #[cfg(target_os = "android")]
 pub use clipboard_service::is_clipboard_service_ok;
 #[cfg(target_os = "linux")]
-pub(crate) mod wayland;
+pub mod wayland;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) mod drm_capturer;
 #[cfg(target_os = "linux")]

@@ -434,12 +434,14 @@ impl PipeWireRecorder {
         src.set_property("path", &format!("{}", capturable.path))?;
         let _ = src.set_property("keepalive-time", &1000i32);
 
+        let convert = gst_element("videoconvert")?;
         let sink = gst_element("appsink")?;
         sink.set_property("drop", &true)?;
         sink.set_property("max-buffers", &1u32)?;
 
-        pipeline.add_many(&[&src, &sink])?;
-        src.link(&sink)?;
+        pipeline.add_many(&[&src, &convert, &sink])?;
+        src.link(&convert)?;
+        convert.link(&sink)?;
         let appsink = sink
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
@@ -453,16 +455,16 @@ impl PipeWireRecorder {
             let caps_str = format!(
                 "video/x-raw(memory:DMABuf),format=BGRx,width={w},height={h},framerate=0/1; \
                  video/x-raw(memory:DMABuf),format=RGBx,width={w},height={h},framerate=0/1; \
-                 video/x-raw,format=BGRx,width={w},height={h}; \
-                 video/x-raw,format=RGBx,width={w},height={h}"
+                 video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
+                 video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
             );
             gst::Caps::from_str(&caps_str).ok()
         } else {
             let caps_str = "\
                 video/x-raw(memory:DMABuf),format=BGRx,framerate=0/1; \
                 video/x-raw(memory:DMABuf),format=RGBx,framerate=0/1; \
-                video/x-raw,format=BGRx; \
-                video/x-raw,format=RGBx";
+                video/x-raw,format=BGRx,framerate=0/1; \
+                video/x-raw,format=RGBx,framerate=0/1";
             gst::Caps::from_str(caps_str).ok()
         };
         appsink.set_caps(caps.as_ref());
