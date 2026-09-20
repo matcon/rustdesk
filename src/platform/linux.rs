@@ -1779,6 +1779,12 @@ pub fn exec_privileged(args: &[&str]) -> ResultType<Child> {
 */
 
 pub fn check_super_user_permission() -> ResultType<bool> {
+    if has_cmd("pkexec") {
+        match std::process::Command::new("pkexec").arg("true").status() {
+            Ok(s) => return Ok(s.success()),
+            Err(e) => log::warn!("pkexec failed: {}, falling back to gtk_sudo", e),
+        }
+    }
     gtk_sudo::run(vec!["echo"])?;
     Ok(true)
 }
@@ -2631,6 +2637,12 @@ fn has_cmd(cmd: &str) -> bool {
 }
 
 pub fn run_cmds_privileged(cmds: &str) -> bool {
+    if has_cmd("pkexec") {
+        match std::process::Command::new("pkexec").arg("sh").arg("-c").arg(cmds).status() {
+            Ok(s) => return s.success(),
+            Err(e) => log::warn!("pkexec failed to spawn: {}, trying gtk_sudo fallback", e),
+        }
+    }
     crate::platform::gtk_sudo::run(vec![cmds]).is_ok()
 }
 
