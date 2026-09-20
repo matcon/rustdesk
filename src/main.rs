@@ -22,6 +22,23 @@ fn main() {
     feature = "flutter"
 )))]
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "linux")]
+    {
+        let is_gui_arg = raw_args.iter().any(|a| a == "--cm" || a == "--install" || a == "--noinstall") 
+            || (raw_args.len() <= 1);
+        if is_gui_arg {
+            let flutter_bin = std::path::Path::new("/usr/share/rustdesk/rustdesk");
+            if flutter_bin.exists() {
+                let mut cmd = std::process::Command::new(flutter_bin);
+                if raw_args.len() > 1 {
+                    cmd.args(&raw_args[1..]);
+                }
+                let status = cmd.status();
+                std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(0));
+            }
+        }
+    }
     #[cfg(all(windows, not(feature = "inline")))]
     unsafe {
         winapi::um::shellscalingapi::SetProcessDpiAwareness(2);

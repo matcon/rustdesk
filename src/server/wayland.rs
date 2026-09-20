@@ -445,6 +445,10 @@ pub(super) fn is_inited() -> Option<Message> {
         if super::drm_capturer::is_available_cached() {
             return None;
         }
+        let capture_backend = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_CAPTURE_BACKEND);
+        if capture_backend == "promptless" || capture_backend == "mutter" {
+            return None;
+        }
         if CAP_DISPLAY_INFO.read().unwrap().is_empty() {
             let mut msg_out = Message::new();
             let res = MessageBox {

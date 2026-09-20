@@ -406,6 +406,30 @@ class _GeneralState extends State<_General> {
   RxBool serviceBtnEnabled = true.obs;
   final GlobalKey _minToolbarOptionKey = GlobalKey();
 
+  final RxString _serviceStatus = ''.obs;
+  final RxBool _autostartEnabled = false.obs;
+  final RxBool _isServiceBusy = false.obs;
+
+  @override
+  void initState() {
+    super.initState();
+    if (isLinux) {
+      _refreshServiceState();
+    }
+  }
+
+  Future<void> _refreshServiceState() async {
+    if (!isLinux) return;
+    try {
+      final res = await Process.run('systemctl', ['--user', 'is-active', 'rustdesk.service']);
+      _serviceStatus.value = res.stdout.toString().trim();
+      final enRes = await Process.run('systemctl', ['--user', 'is-enabled', 'rustdesk.service']);
+      _autostartEnabled.value = enRes.stdout.toString().trim() == 'enabled';
+    } catch (e) {
+      debugPrint('Error refreshing service state: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final scrollController = ScrollController();
@@ -413,6 +437,7 @@ class _GeneralState extends State<_General> {
       controller: scrollController,
       children: [
         if (!isWeb) service(),
+        if (!isWeb) closeBehavior(),
         theme(),
         _Card(title: 'Language', children: [language()]),
         if (!isWeb) hwcodec(),
@@ -422,6 +447,41 @@ class _GeneralState extends State<_General> {
         other()
       ],
     ).marginOnly(bottom: _kListViewBottomMargin);
+  }
+
+  Widget closeBehavior() {
+    final current = bind.mainGetLocalOption(key: 'close-behavior');
+    final val = current == 'close' ? 'close' : 'tray';
+
+    onChanged(String value) async {
+      await bind.mainSetLocalOption(key: 'close-behavior', value: value);
+      setState(() {});
+    }
+
+    final isEs = localeName.startsWith('es');
+    return _Card(
+      title: isEs ? 'Comportamiento al cerrar la ventana' : 'Action on close',
+      children: [
+        _Radio<String>(
+          context,
+          value: 'tray',
+          groupValue: val,
+          label: isEs
+              ? 'Minimizar a la bandeja del sistema (Permanecer en segundo plano)'
+              : 'Minimize to system tray (Keep running in background)',
+          onChanged: onChanged,
+        ),
+        _Radio<String>(
+          context,
+          value: 'close',
+          groupValue: val,
+          label: isEs
+              ? 'Cerrar la aplicación por completo (Salir)'
+              : 'Exit application completely',
+          onChanged: onChanged,
+        ),
+      ],
+    );
   }
 
   Widget theme() {
@@ -458,6 +518,155 @@ class _GeneralState extends State<_General> {
 
     final hideStopService =
         bind.mainGetBuildinOption(key: kOptionHideStopService) == 'Y';
+
+    final isEs = localeName.startsWith('es');
+
+    if (isLinux) {
+      return Obx(() {
+        final isActive = _serviceStatus.value == 'active';
+        return _Card(
+          title: isEs ? 'Servicio de RustDesk' : 'RustDesk Service',
+          title_suffix: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: (isActive ? Colors.green : Colors.red).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(4),
+                border: Border.all(
+                  color: (isActive ? Colors.green : Colors.red).withOpacity(0.5),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.circle,
+                    size: 9,
+                    color: isActive ? Colors.green : Colors.red,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    isActive
+                        ? (isEs ? 'Activo (En ejecución)' : 'Active (Running)')
+                        : (isEs ? 'Detenido' : 'Stopped'),
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      color: isActive ? Colors.green : Colors.red,
+                    ),
+                  ),
+                ],
+              ),
+            ).marginOnly(right: _kContentHMargin),
+          ],
+          children: [
+            Row(
+              children: [
+                if (!isActive)
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.play_arrow, size: 16),
+                    label: Text(isEs ? 'Iniciar Servicio' : 'Start Service'),
+                    onPressed: _isServiceBusy.value
+                        ? null
+                        : () async {
+                            _isServiceBusy.value = true;
+                            await Process.run('systemctl', ['--user', 'start', 'rustdesk.service']);
+                            await Future.delayed(const Duration(milliseconds: 500));
+                            await _refreshServiceState();
+                            _isServiceBusy.value = false;
+                          },
+                  ).marginOnly(right: 10),
+                if (isActive) ...[
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.stop, size: 16),
+                    label: Text(isEs ? 'Detener' : 'Stop'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red.shade700,
+                      foregroundColor: Colors.white,
+                    ),
+                    onPressed: _isServiceBusy.value
+                        ? null
+                        : () async {
+                            _isServiceBusy.value = true;
+                            await Process.run('systemctl', ['--user', 'stop', 'rustdesk.service']);
+                            await Future.delayed(const Duration(milliseconds: 500));
+                            await _refreshServiceState();
+                            _isServiceBusy.value = false;
+                          },
+                  ).marginOnly(right: 10),
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: Text(isEs ? 'Reiniciar' : 'Restart'),
+                    onPressed: _isServiceBusy.value
+                        ? null
+                        : () async {
+                            _isServiceBusy.value = true;
+                            await Process.run('systemctl', ['--user', 'restart', 'rustdesk.service']);
+                            await Future.delayed(const Duration(milliseconds: 500));
+                            await _refreshServiceState();
+                            _isServiceBusy.value = false;
+                          },
+                  ).marginOnly(right: 10),
+                ],
+                IconButton(
+                  tooltip: isEs ? 'Actualizar estado' : 'Refresh status',
+                  icon: const Icon(Icons.sync, size: 18),
+                  onPressed: _isServiceBusy.value ? null : _refreshServiceState,
+                ),
+              ],
+            ).marginOnly(left: _kContentHMargin, bottom: 8),
+            Row(
+              children: [
+                Checkbox(
+                  value: _autostartEnabled.value,
+                  onChanged: _isServiceBusy.value
+                      ? null
+                      : (val) async {
+                          if (val == null) return;
+                          _isServiceBusy.value = true;
+                          if (val) {
+                            await Process.run('systemctl', ['--user', 'enable', 'rustdesk.service']);
+                          } else {
+                            await Process.run('systemctl', ['--user', 'disable', 'rustdesk.service']);
+                          }
+                          await Future.delayed(const Duration(milliseconds: 300));
+                          await _refreshServiceState();
+                          _isServiceBusy.value = false;
+                        },
+                ),
+                Expanded(
+                  child: GestureDetector(
+                    onTap: _isServiceBusy.value
+                        ? null
+                        : () async {
+                            final nextVal = !_autostartEnabled.value;
+                            _isServiceBusy.value = true;
+                            if (nextVal) {
+                              await Process.run('systemctl', ['--user', 'enable', 'rustdesk.service']);
+                            } else {
+                              await Process.run('systemctl', ['--user', 'disable', 'rustdesk.service']);
+                            }
+                            await Future.delayed(const Duration(milliseconds: 300));
+                            await _refreshServiceState();
+                            _isServiceBusy.value = false;
+                          },
+                    child: Text(
+                      isEs
+                          ? 'Iniciar servicio automáticamente al iniciar sesión (Autostart)'
+                          : 'Start service automatically on login (Autostart)',
+                      style: TextStyle(
+                        fontSize: _kContentFontSize,
+                        color: disabledTextColor(context, !_isServiceBusy.value),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ).marginOnly(left: _kContentHMargin - 8),
+          ],
+        );
+      });
+    }
 
     return Obx(() {
       if (hideStopService && !serviceStop.value) {
@@ -2203,10 +2412,10 @@ class _DisplayState extends State<_Display> {
   }
 
   Widget wayland(BuildContext context) {
-    final captureOpt = bind.mainGetOption(key: kOptionWaylandCaptureBackend);
-    final inputOpt = bind.mainGetOption(key: kOptionWaylandInputBackend);
-    final dmabufOpt = bind.mainGetOption(key: kOptionWaylandDmaBuf);
-    final cursorOpt = bind.mainGetOption(key: kOptionWaylandCursorMode);
+    final captureOpt = bind.mainGetOptionSync(key: kOptionWaylandCaptureBackend);
+    final inputOpt = bind.mainGetOptionSync(key: kOptionWaylandInputBackend);
+    final dmabufOpt = bind.mainGetOptionSync(key: kOptionWaylandDmaBuf);
+    final cursorOpt = bind.mainGetOptionSync(key: kOptionWaylandCursorMode);
 
     final currentCapture = captureOpt.isEmpty ? 'auto' : captureOpt;
     final currentInput = inputOpt.isEmpty ? 'auto' : inputOpt;

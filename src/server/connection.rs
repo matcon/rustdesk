@@ -2099,15 +2099,15 @@ impl Connection {
             self.last_supported_encoding = Some(supported_encoding.clone());
             log::info!("peer info supported_encoding: {:?}", supported_encoding);
             pi.encoding = Some(supported_encoding).into();
-            if let Some(msg_out) = super::display_service::is_inited_msg() {
-                self.send(msg_out).await;
-            }
 
             try_activate_screen();
 
             match super::display_service::update_get_sync_displays_on_login().await {
                 Err(err) => {
                     res.set_error(format!("{}", err));
+                    if let Some(msg_out) = super::display_service::is_inited_msg() {
+                        self.send(msg_out).await;
+                    }
                 }
                 Ok((displays, primary_display_idx)) => {
                     // For compatibility with old versions, we need to send the displays to the peer.

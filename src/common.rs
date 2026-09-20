@@ -848,8 +848,21 @@ pub fn run_me<T: AsRef<std::ffi::OsStr>>(args: Vec<T>) -> std::io::Result<std::p
             return std::process::Command::new(appimage_cmd).args(&args).spawn();
         }
     }
-    let cmd = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(cmd);
+    let mut cmd_path = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    {
+        let is_gui = args.iter().any(|x| {
+            let s = x.as_ref().to_string_lossy();
+            s == "--cm" || s == "--install" || s == "--noinstall"
+        }) || args.is_empty();
+        if is_gui {
+            let flutter_bin = std::path::Path::new("/usr/share/rustdesk/rustdesk");
+            if flutter_bin.exists() {
+                cmd_path = flutter_bin.to_path_buf();
+            }
+        }
+    }
+    let mut cmd = std::process::Command::new(cmd_path);
     #[cfg(windows)]
     let mut force_foreground = false;
     #[cfg(windows)]

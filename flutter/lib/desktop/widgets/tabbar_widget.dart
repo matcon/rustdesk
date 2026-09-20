@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:ui' as ui;
 
@@ -432,7 +433,17 @@ class _DesktopTabState extends State<DesktopTab>
 
   @override
   void onWindowClose() async {
-    mainWindowClose() async => await windowManager.hide();
+    mainWindowClose() async {
+      final closeBehavior = bind.mainGetLocalOption(key: 'close-behavior');
+      if (closeBehavior == 'close') {
+        try {
+          await windowManager.destroy();
+        } catch (_) {}
+        exit(0);
+      } else {
+        await windowManager.hide();
+      }
+    }
     notMainWindowClose(WindowController windowController) async {
       if (controller.length != 0) {
         debugPrint("close not empty multiwindow from taskbar");

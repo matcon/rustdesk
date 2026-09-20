@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set custom options
     Config::set_option(OPTION_WAYLAND_CAPTURE_BACKEND.to_string(), "promptless".to_string());
     Config::set_option(OPTION_WAYLAND_INPUT_BACKEND.to_string(), "uinput".to_string());
-    Config::set_option(OPTION_WAYLAND_DMABUF.to_string(), "Y".to_string());
+    Config::set_option(OPTION_WAYLAND_DMABUF.to_string(), "N".to_string());
     Config::set_option(OPTION_WAYLAND_CURSOR_MODE.to_string(), "embedded".to_string());
 
     // Verify retrieval
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(cap_val, "promptless");
     assert_eq!(inp_val, "uinput");
-    assert_eq!(dma_val, "Y");
+    assert_eq!(dma_val, "N");
     assert_eq!(cur_val, "embedded");
     log::info!("All configuration keys verified successfully!");
 

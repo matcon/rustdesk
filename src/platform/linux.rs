@@ -1415,7 +1415,14 @@ where
         Some(id_name) => id_name,
         None => get_active_user_id_name(),
     };
-    let cmd = std::env::current_exe()?;
+    let mut cmd = std::env::current_exe()?;
+    let is_cm_or_gui = arg.iter().any(|x| *x == "--cm" || *x == "--install" || *x == "--noinstall") || arg.is_empty();
+    if is_cm_or_gui {
+        let flutter_bin = std::path::Path::new("/usr/share/rustdesk/rustdesk");
+        if flutter_bin.exists() {
+            cmd = flutter_bin.to_path_buf();
+        }
+    }
     if uid.is_empty() {
         bail!("No valid uid");
     }

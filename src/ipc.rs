@@ -1155,9 +1155,27 @@ async fn handle(data: Data, stream: &mut Connection) {
                     Some(v)
                 }
             } else if value == "clear" {
+                let old_token = get_local_option(key.clone());
                 set_local_option(key.clone(), "".to_owned());
                 #[cfg(target_os = "linux")]
-                scrap::wayland::pipewire::close_session();
+                {
+                    scrap::wayland::pipewire::close_session();
+                    if !old_token.is_empty() {
+                        let _ = std::process::Command::new("busctl")
+                            .args(&[
+                                "--user",
+                                "call",
+                                "org.freedesktop.impl.portal.PermissionStore",
+                                "/org/freedesktop/impl/portal/PermissionStore",
+                                "org.freedesktop.impl.portal.PermissionStore",
+                                "Delete",
+                                "ss",
+                                "screencast",
+                                &old_token,
+                            ])
+                            .output();
+                    }
+                }
                 Some("".to_owned())
             } else {
                 None

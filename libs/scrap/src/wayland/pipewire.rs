@@ -431,7 +431,9 @@ impl PipeWireRecorder {
         } else {
             debug!("[gstreamer] Bound pipewiresrc directly via path: {}", capturable.path);
         }
-        src.set_property("path", &format!("{}", capturable.path))?;
+        let path_str = format!("{}", capturable.path);
+        let _ = src.set_property("target-object", &path_str);
+        let _ = src.set_property("path", &path_str);
         let _ = src.set_property("keepalive-time", &1000i32);
 
         let convert = gst_element("videoconvert")?;
@@ -447,40 +449,10 @@ impl PipeWireRecorder {
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
 
         let enable_dmabuf = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_DMABUF) != "N";
-        let caps = if capturable.physical_size.0 > 0 && capturable.physical_size.1 > 0 {
-            let (w, h) = (
-                capturable.physical_size.0 as i32,
-                capturable.physical_size.1 as i32,
-            );
-            debug!("[gstreamer] Constraining appsink caps to {}x{}, dmabuf={}", w, h, enable_dmabuf);
-            let caps_str = if enable_dmabuf {
-                format!(
-                    "video/x-raw(memory:DMABuf),format=BGRx,width={w},height={h},framerate=0/1; \
-                     video/x-raw(memory:DMABuf),format=RGBx,width={w},height={h},framerate=0/1; \
-                     video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
-                     video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
-                )
-            } else {
-                format!(
-                    "video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
-                     video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
-                )
-            };
-            gst::Caps::from_str(&caps_str).ok()
-        } else {
-            let caps_str = if enable_dmabuf {
-                "\
-                video/x-raw(memory:DMABuf),format=BGRx,framerate=0/1; \
-                video/x-raw(memory:DMABuf),format=RGBx,framerate=0/1; \
-                video/x-raw,format=BGRx,framerate=0/1; \
-                video/x-raw,format=RGBx,framerate=0/1"
-            } else {
-                "\
-                video/x-raw,format=BGRx,framerate=0/1; \
-                video/x-raw,format=RGBx,framerate=0/1"
-            };
-            gst::Caps::from_str(caps_str).ok()
-        };
+        let caps_str = "\
+            video/x-raw,format=BGRx; \
+            video/x-raw,format=RGBx";
+        let caps = gst::Caps::from_str(caps_str).ok();
         appsink.set_caps(caps.as_ref());
 
         // [Workaround]
@@ -1328,6 +1300,14 @@ fn on_select_devices_response(
             args.insert("multiple".into(), Variant(Box::new(true)));
         }
         args.insert("types".into(), Variant(Box::new(1u32))); //| 2u32)));
+        if is_support_restore_token {
+            let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
+            if !restore_token.is_empty() {
+                info!("Passing existing restore_token to RemoteDesktop SelectSources: {}", restore_token);
+                args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
+            }
+            args.insert("persist_mode".to_string(), Variant(Box::new(2u32)));
+        }
 
         let session = session.clone();
         trace.waiting(PortalStage::SelectSources);
@@ -1363,7 +1343,18 @@ fn on_select_sources_response(
     &SyncConnection,
     &dbus::Message,
 ) -> Result<(), Box<dyn Error>> {
-    move |_: OrgFreedesktopPortalRequestResponse, c, _| {
+    move |r: OrgFreedesktopPortalRequestResponse, c, _| {
+        if is_support_restore_token {
+            if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
+                if let Some(restore_token) = restore_token.as_str() {
+                    info!("Got restore_token from SelectSources: {}", restore_token);
+                    config::LocalConfig::set_option(
+                        RESTORE_TOKEN_CONF_KEY.to_owned(),
+                        restore_token.to_owned(),
+                    );
+                }
+            }
+        }
         let portal = get_portal(c);
         let mut args: PropMap = HashMap::new();
         let start_handle_token = "u4";
@@ -1411,16 +1402,14 @@ fn on_start_response(
 ) -> Result<(), Box<dyn Error>> {
     move |r: OrgFreedesktopPortalRequestResponse, c, _| {
         let portal = get_portal(c);
-        let use_rdp = can_use_remote_desktop_portal(&portal);
-        if !use_rdp {
-            if is_support_restore_token {
-                if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
-                    if let Some(restore_token) = restore_token.as_str() {
-                        config::LocalConfig::set_option(
-                            RESTORE_TOKEN_CONF_KEY.to_owned(),
-                            restore_token.to_owned(),
-                        );
-                    }
+        if is_support_restore_token {
+            if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
+                if let Some(restore_token) = restore_token.as_str() {
+                    info!("Got restore_token from Start: {}", restore_token);
+                    config::LocalConfig::set_option(
+                        RESTORE_TOKEN_CONF_KEY.to_owned(),
+                        restore_token.to_owned(),
+                    );
                 }
             }
         }
