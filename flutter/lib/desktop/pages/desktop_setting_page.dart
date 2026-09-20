@@ -570,6 +570,7 @@ class _GeneralState extends State<_General> {
                         ? null
                         : () async {
                             _isServiceBusy.value = true;
+                            await bind.mainSetOption(key: 'stop-service', value: '');
                             await Process.run('systemctl', ['--user', 'start', 'rustdesk.service']);
                             await Future.delayed(const Duration(milliseconds: 500));
                             await _refreshServiceState();
@@ -588,6 +589,7 @@ class _GeneralState extends State<_General> {
                         ? null
                         : () async {
                             _isServiceBusy.value = true;
+                            await bind.mainSetOption(key: 'stop-service', value: 'Y');
                             await Process.run('systemctl', ['--user', 'stop', 'rustdesk.service']);
                             await Future.delayed(const Duration(milliseconds: 500));
                             await _refreshServiceState();
@@ -601,6 +603,7 @@ class _GeneralState extends State<_General> {
                         ? null
                         : () async {
                             _isServiceBusy.value = true;
+                            await bind.mainSetOption(key: 'stop-service', value: '');
                             await Process.run('systemctl', ['--user', 'restart', 'rustdesk.service']);
                             await Future.delayed(const Duration(milliseconds: 500));
                             await _refreshServiceState();
