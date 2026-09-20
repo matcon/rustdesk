@@ -653,6 +653,47 @@ static mut VIRTUAL_INPUT_STATE: Option<VirtualInputState> = None;
 // Thus this function must not be called in a temporary runtime.
 #[cfg(target_os = "linux")]
 pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
+    let input_backend = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_INPUT_BACKEND);
+
+    // If user explicitly configured "uinput", attempt direct uinput first
+    if input_backend == "uinput" {
+        log::info!("User explicitly configured 'uinput' direct input backend");
+        let direct_k = super::uinput::direct::DirectUInputKeyboard::new();
+        let direct_m = super::uinput::direct::DirectUInputMouse::new((minx, maxx), (miny, maxy));
+        match (direct_k, direct_m) {
+            (Ok(keyboard), Ok(mouse)) => {
+                log::info!("Direct UInput keyboard & mouse created successfully in current process!");
+                let mut en = ENIGO.lock().unwrap();
+                en.set_is_x11(false);
+                en.set_custom_keyboard(Box::new(keyboard));
+                en.set_custom_mouse(Box::new(mouse));
+                return Ok(());
+            }
+            (Err(e), _) => bail!("Direct /dev/uinput keyboard creation failed: {}", e),
+            (_, Err(e)) => bail!("Direct /dev/uinput mouse creation failed: {}", e),
+        }
+    }
+
+    // If user explicitly configured "portal", attempt RemoteDesktop portal directly
+    if input_backend == "portal" {
+        log::info!("User explicitly configured 'portal' RemoteDesktop input backend");
+        return setup_rdp_input().await.map_err(|e| hbb_common::anyhow::anyhow!("{}", e));
+    }
+
+    // If user explicitly configured "service", require service IPC
+    if input_backend == "service" {
+        log::info!("User explicitly configured 'service' IPC input backend");
+        set_uinput_resolution(minx, maxx, miny, maxy).await?;
+        let keyboard = super::uinput::client::UInputKeyboard::new().await?;
+        let mouse = super::uinput::client::UInputMouse::new().await?;
+        let mut en = ENIGO.lock().unwrap();
+        en.set_is_x11(false);
+        en.set_custom_keyboard(Box::new(keyboard));
+        en.set_custom_mouse(Box::new(mouse));
+        return Ok(());
+    }
+
+    // Default / "auto": Multi-tier fallback (Service IPC -> Direct uinput -> Portal)
     // 1. Try service IPC first (if rustdesk --service is running as root)
     let service_ok = if let Ok(()) = set_uinput_resolution(minx, maxx, miny, maxy).await {
         if let (Ok(keyboard), Ok(mouse)) = (

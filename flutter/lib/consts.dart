@@ -230,6 +230,11 @@ const String kOptionKeepAwakeDuringOutgoingSessions = "keep-awake-during-outgoin
 
 const String kOptionShowMobileAction = "showMobileActions";
 
+const String kOptionWaylandCaptureBackend = "wayland-capture-backend";
+const String kOptionWaylandInputBackend = "wayland-input-backend";
+const String kOptionWaylandDmaBuf = "wayland-dmabuf";
+const String kOptionWaylandCursorMode = "wayland-cursor-mode";
+
 const String kUrlActionClose = "close";
 
 const String kTabLabelHomePage = "Home";

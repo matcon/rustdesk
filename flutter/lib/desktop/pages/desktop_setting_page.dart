@@ -1951,6 +1951,7 @@ class _DisplayState extends State<_Display> {
       imageQuality(context),
       codec(context),
       if (isDesktop) trackpadSpeed(context),
+      if (Platform.isLinux) wayland(context),
       if (!isWeb) privacyModeImpl(context),
       other(context),
     ]).marginOnly(bottom: _kListViewBottomMargin);
@@ -2199,6 +2200,179 @@ class _DisplayState extends State<_Display> {
           ],
         ).marginOnly(left: _kCheckBoxLeftMargin),
         onTap: isOptFixed ? null : () => onChanged(!value));
+  }
+
+  Widget wayland(BuildContext context) {
+    final captureOpt = bind.mainGetOption(key: kOptionWaylandCaptureBackend);
+    final inputOpt = bind.mainGetOption(key: kOptionWaylandInputBackend);
+    final dmabufOpt = bind.mainGetOption(key: kOptionWaylandDmaBuf);
+    final cursorOpt = bind.mainGetOption(key: kOptionWaylandCursorMode);
+
+    final currentCapture = captureOpt.isEmpty ? 'auto' : captureOpt;
+    final currentInput = inputOpt.isEmpty ? 'auto' : inputOpt;
+    final isDmaBuf = dmabufOpt != 'N';
+    final currentCursor = cursorOpt.isEmpty ? 'embedded' : cursorOpt;
+
+    final isWaylandActive = Platform.environment.containsKey('WAYLAND_DISPLAY') ||
+        (Platform.environment['XDG_SESSION_TYPE'] == 'wayland');
+    final compositorName = Platform.environment['XDG_CURRENT_DESKTOP'] ?? 'Wayland';
+
+    return _Card(
+      title: 'Wayland (Linux)',
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: _kContentHMargin, vertical: 4),
+          child: Row(
+            children: [
+              Icon(
+                isWaylandActive ? Icons.check_circle_outline : Icons.info_outline,
+                size: 18,
+                color: isWaylandActive ? Colors.green : Colors.orange,
+              ).marginOnly(right: 8),
+              Text(
+                isWaylandActive
+                    ? 'Wayland session active ($compositorName)'
+                    : 'Wayland session not active (X11)',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: isWaylandActive ? Colors.green : Colors.orange,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Screen Capture Backend',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 13,
+            color: Theme.of(context).textTheme.titleSmall?.color,
+          ),
+        ).marginOnly(left: _kContentHMargin, top: 4, bottom: 2),
+        _Radio(context,
+            value: 'auto',
+            groupValue: currentCapture,
+            label: 'Auto (Promptless D-Bus with Portal Fallback)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandCaptureBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'promptless',
+            groupValue: currentCapture,
+            label: 'Promptless ScreenCast (Niri / GNOME D-Bus)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandCaptureBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'portal',
+            groupValue: currentCapture,
+            label: 'XDG Desktop Portal (Dialog Prompt)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandCaptureBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'drm',
+            groupValue: currentCapture,
+            label: 'DRM / KMS (Direct Scanout)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandCaptureBackend, value: v);
+              setState(() {});
+            }),
+        const Divider(height: 20).marginSymmetric(horizontal: _kContentHMargin),
+        Text(
+          'Input Injection Backend',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 13,
+            color: Theme.of(context).textTheme.titleSmall?.color,
+          ),
+        ).marginOnly(left: _kContentHMargin, top: 4, bottom: 2),
+        _Radio(context,
+            value: 'auto',
+            groupValue: currentInput,
+            label: 'Auto (Service -> Direct /dev/uinput -> Portal)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandInputBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'uinput',
+            groupValue: currentInput,
+            label: 'Direct /dev/uinput (Unprivileged Kernel Device)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandInputBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'service',
+            groupValue: currentInput,
+            label: 'RustDesk System Service IPC',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandInputBackend, value: v);
+              setState(() {});
+            }),
+        _Radio(context,
+            value: 'portal',
+            groupValue: currentInput,
+            label: 'RemoteDesktop Portal (XDG Portal)',
+            onChanged: (v) async {
+              await bind.mainSetOption(key: kOptionWaylandInputBackend, value: v);
+              setState(() {});
+            }),
+        const Divider(height: 20).marginSymmetric(horizontal: _kContentHMargin),
+        GestureDetector(
+          child: Row(
+            children: [
+              Checkbox(
+                value: isDmaBuf,
+                onChanged: (_) async {
+                  await bind.mainSetOption(
+                      key: kOptionWaylandDmaBuf, value: isDmaBuf ? 'N' : 'Y');
+                  setState(() {});
+                },
+              ).marginOnly(right: 5),
+              Expanded(
+                child: Text(translate('Hardware DMA-BUF Zero-Copy Acceleration')),
+              )
+            ],
+          ).marginOnly(left: _kCheckBoxLeftMargin),
+          onTap: () async {
+            await bind.mainSetOption(
+                key: kOptionWaylandDmaBuf, value: isDmaBuf ? 'N' : 'Y');
+            setState(() {});
+          },
+        ),
+        GestureDetector(
+          child: Row(
+            children: [
+              Checkbox(
+                value: currentCursor == 'embedded',
+                onChanged: (_) async {
+                  await bind.mainSetOption(
+                      key: kOptionWaylandCursorMode,
+                      value: currentCursor == 'embedded' ? 'hidden' : 'embedded');
+                  setState(() {});
+                },
+              ).marginOnly(right: 5),
+              Expanded(
+                child: Text(translate('Embed Hardware Cursor in Video Stream')),
+              )
+            ],
+          ).marginOnly(left: _kCheckBoxLeftMargin),
+          onTap: () async {
+            await bind.mainSetOption(
+                key: kOptionWaylandCursorMode,
+                value: currentCursor == 'embedded' ? 'hidden' : 'embedded');
+            setState(() {});
+          },
+        ),
+      ],
+    );
   }
 
   Widget other(BuildContext context) {

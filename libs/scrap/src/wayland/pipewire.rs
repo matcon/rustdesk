@@ -446,25 +446,39 @@ impl PipeWireRecorder {
             .dynamic_cast::<AppSink>()
             .map_err(|_| GStreamerError("Sink element is expected to be an appsink!".into()))?;
 
+        let enable_dmabuf = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_DMABUF) != "N";
         let caps = if capturable.physical_size.0 > 0 && capturable.physical_size.1 > 0 {
             let (w, h) = (
                 capturable.physical_size.0 as i32,
                 capturable.physical_size.1 as i32,
             );
-            debug!("[gstreamer] Constraining appsink caps to {}x{}", w, h);
-            let caps_str = format!(
-                "video/x-raw(memory:DMABuf),format=BGRx,width={w},height={h},framerate=0/1; \
-                 video/x-raw(memory:DMABuf),format=RGBx,width={w},height={h},framerate=0/1; \
-                 video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
-                 video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
-            );
+            debug!("[gstreamer] Constraining appsink caps to {}x{}, dmabuf={}", w, h, enable_dmabuf);
+            let caps_str = if enable_dmabuf {
+                format!(
+                    "video/x-raw(memory:DMABuf),format=BGRx,width={w},height={h},framerate=0/1; \
+                     video/x-raw(memory:DMABuf),format=RGBx,width={w},height={h},framerate=0/1; \
+                     video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
+                     video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
+                )
+            } else {
+                format!(
+                    "video/x-raw,format=BGRx,width={w},height={h},framerate=0/1; \
+                     video/x-raw,format=RGBx,width={w},height={h},framerate=0/1"
+                )
+            };
             gst::Caps::from_str(&caps_str).ok()
         } else {
-            let caps_str = "\
+            let caps_str = if enable_dmabuf {
+                "\
                 video/x-raw(memory:DMABuf),format=BGRx,framerate=0/1; \
                 video/x-raw(memory:DMABuf),format=RGBx,framerate=0/1; \
                 video/x-raw,format=BGRx,framerate=0/1; \
-                video/x-raw,format=RGBx,framerate=0/1";
+                video/x-raw,format=RGBx,framerate=0/1"
+            } else {
+                "\
+                video/x-raw,format=BGRx,framerate=0/1; \
+                video/x-raw,format=RGBx,framerate=0/1"
+            };
             gst::Caps::from_str(caps_str).ok()
         };
         appsink.set_caps(caps.as_ref());
@@ -999,15 +1013,24 @@ pub fn try_mutter_screencast() -> ResultType<(
     })
     .map_err(|e| anyhow!("Failed to add match for PipeWireStreamAdded: {}", e))?;
 
+    let cursor_mode_opt = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_CURSOR_MODE);
+    let cursor_mode: u32 = match cursor_mode_opt.as_str() {
+        "hidden" => 0,
+        "metadata" => 2,
+        _ => 1, // embedded (default)
+    };
+
     for conn_name in &connectors {
+        let mut props = HashMap::<String, Variant<Box<dyn RefArg>>>::new();
+        props.insert("cursor-mode".to_string(), Variant(Box::new(cursor_mode)));
         let (stream_path,): (dbus::Path<'static>,) = session_proxy
             .method_call(
                 "org.gnome.Mutter.ScreenCast.Session",
                 "RecordMonitor",
-                (conn_name, HashMap::<String, Variant<Box<dyn RefArg>>>::new()),
+                (conn_name, props),
             )
             .map_err(|e| anyhow!("RecordMonitor for {} failed: {}", conn_name, e))?;
-        debug!("[mutter] Recorded monitor {} -> stream: {}", conn_name, stream_path);
+        debug!("[mutter] Recorded monitor {} (cursor-mode={}) -> stream: {}", conn_name, cursor_mode, stream_path);
     }
 
     let (): () = session_proxy
@@ -1427,15 +1450,30 @@ pub fn get_capturables() -> Result<Vec<PipeWireCapturable>, Box<dyn Error>> {
     };
 
     if rdp_connection.is_none() {
-        let (conn, fd, streams, session, is_support_restore_token) = match try_mutter_screencast() {
-            Ok(tuple) => {
-                info!("[pipewire] Using direct Mutter ScreenCast (promptless)");
-                tuple
-            }
-            Err(e) => {
-                debug!("[pipewire] Mutter ScreenCast unavailable ({}), falling back to portal", e);
+        let capture_backend = hbb_common::config::Config::get_option(hbb_common::config::OPTION_WAYLAND_CAPTURE_BACKEND);
+        let (conn, fd, streams, session, is_support_restore_token) = match capture_backend.as_str() {
+            "portal" => {
+                info!("[pipewire] User explicitly configured 'portal' capture backend");
                 let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
                 (conn, Some(fd), streams, session, is_support_restore_token)
+            }
+            "promptless" | "mutter" => {
+                info!("[pipewire] User explicitly configured 'promptless' (Mutter ScreenCast) backend");
+                try_mutter_screencast()?
+            }
+            _ => {
+                // "auto" or default
+                match try_mutter_screencast() {
+                    Ok(tuple) => {
+                        info!("[pipewire] Using direct Mutter ScreenCast (promptless)");
+                        tuple
+                    }
+                    Err(e) => {
+                        debug!("[pipewire] Mutter ScreenCast unavailable ({}), falling back to portal", e);
+                        let (conn, fd, streams, session, is_support_restore_token) = request_remote_desktop(false)?;
+                        (conn, Some(fd), streams, session, is_support_restore_token)
+                    }
+                }
             }
         };
         let conn = Arc::new(conn);
